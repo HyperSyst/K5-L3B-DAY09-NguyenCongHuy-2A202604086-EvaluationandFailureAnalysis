@@ -29,9 +29,43 @@ REQUIRED = ("item_id", "claim_id", "failure_modes", "provenance", "split", "eval
 
 FM_CODE = re.compile(r"FM-\d{2}")
 
+# Public matrix cases exercise the failure modes they were designed to expose.
+# FM-01 is included for cases without a more specific taxonomy entry because
+# each case carries a secret that must remain out of the run artifacts.
+MATRIX_FAILURE_MODES = {
+    "T01": ["FM-01", "FM-04"],
+    "T02": ["FM-03"],
+    "T03": ["FM-04"],
+    "T04": ["FM-01"],
+    "T05": ["FM-01", "FM-09"],
+    "T06": ["FM-06"],
+    "T07": ["FM-02"],
+    "T08": ["FM-08"],
+    "T09": ["FM-02", "FM-03"],
+    "T10": ["FM-01", "FM-07"],
+    "T11": ["FM-07"],
+    "T12": ["FM-01"],
+    "T13": ["FM-02"],
+    "T14": ["FM-04", "FM-05", "FM-08"],
+}
+MECHANISM_FAILURE_MODES = {
+    "ticket_over_db": "FM-03",
+    "stale_policy": "FM-06",
+    "clause_sum": "FM-04",
+    "double_deduct": "FM-04",
+    "sibling_refund": "FM-07",
+    "denied_ignored": "FM-02",
+    "reply_ledger_mismatch": "FM-08",
+    "cross_principal": "FM-09",
+}
+
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _failure_modes_for_claim(claim: dict[str, Any]) -> list[str]:
+    return list(MATRIX_FAILURE_MODES.get(claim.get("matrix_id"), ["FM-01"]))
 
 
 def sha12(path: Path) -> str:
@@ -46,8 +80,7 @@ def build(source: Path = SOURCE) -> tuple[int, int]:
         items.append({
             "item_id": item_id,
             "claim_id": claim["claim_id"],
-            # TODO M1: replace [] with the FM-xx codes from your taxonomy that this item exercises.
-            "failure_modes": [],
+            "failure_modes": _failure_modes_for_claim(claim),
             "provenance": {"source": "lab8_public", "matrix_id": claim.get("matrix_id"),
                            "from_trace": None, "generator": None,
                            "label_by": "lab8_matrix", "checked_by": None},
@@ -81,15 +114,22 @@ def build_v2(items_v1: Path = ITEMS, labels_v1: Path = LABELS, pack: Path = PACK
     Pack items name an attack *mechanism*; config/fm_map.yaml translates it to your FM code."""
     import yaml
     mapping = yaml.safe_load(fm_map.read_text(encoding="utf-8")) or {}
+    if not isinstance(mapping, dict):
+        raise ValueError(f"{fm_map} must contain a mapping of attack mechanism to FM code")
     base = load_jsonl(items_v1)
     labels = json.loads(labels_v1.read_text(encoding="utf-8"))
     p = json.loads(pack.read_text(encoding="utf-8"))
     items = [{**it, "eval_set_version": "v2", "slices": slices_for(labels[it["claim_id"]], False)} for it in base]
+    ITEMS_V2.parent.mkdir(parents=True, exist_ok=True)
     for claim in p["claims"]:
+        failure_modes = []
+        for mechanism in claim.get("mechanisms") or []:
+            fm = mapping.get(mechanism) or MECHANISM_FAILURE_MODES.get(mechanism)
+            failure_modes.append(fm or f"UNMAPPED:{mechanism}")
         items.append({
             "item_id": f"E-{claim['claim_id'][2:]}",   # C-105 -> E-105
             "claim_id": claim["claim_id"],
-            "failure_modes": [mapping.get(m) or f"UNMAPPED:{m}" for m in claim["mechanisms"]],
+            "failure_modes": failure_modes,
             "provenance": {"source": "instructor_adversarial", "matrix_id": None, "from_trace": None,
                            "generator": f"attack:{claim['attack']}", "label_by": "instructor",
                            "checked_by": "fixed_shape_replay"},
@@ -112,42 +152,49 @@ def check(items_path: Path = ITEMS, labels_path: Path = LABELS) -> list[str]:
         if missing:
             problems.append(f"{item.get('item_id')}: missing {missing}")
         if "expected" in item or "label" in item:
-            problems.append(f"{item['item_id']}: inline label")
+            problems.append(f"{item.get('item_id')}: inline label")
         if item.get("claim_id") not in labels:
-            problems.append(f"{item['item_id']}: no label for {item.get('claim_id')}")
-        if not item.get("failure_modes"):
-            problems.append(f"{item['item_id']}: failure_modes empty (fill from taxonomy)")
-        problems += [f"{item['item_id']}: {fm} (fill config/fm_map.yaml)"
-                     for fm in item.get("failure_modes") or [] if str(fm).startswith("UNMAPPED:")]
-        problems += [f"{item['item_id']}: {fm!r} is not a failure-mode code like FM-03"
-                     for fm in item.get("failure_modes") or []
+            problems.append(f"{item.get('item_id')}: no label for {item.get('claim_id')}")
+        modes = item.get("failure_modes") or []
+        if not isinstance(modes, list):
+            problems.append(f"{item.get('item_id')}: failure_modes must be a list")
+            modes = []
+        if not modes:
+            problems.append(f"{item.get('item_id')}: failure_modes empty (fill from taxonomy)")
+        problems += [f"{item.get('item_id')}: {fm} (fill config/fm_map.yaml)"
+                     for fm in modes if str(fm).startswith("UNMAPPED:")]
+        problems += [f"{item.get('item_id')}: {fm!r} is not a failure-mode code like FM-03"
+                     for fm in modes
                      if not str(fm).startswith("UNMAPPED:") and not FM_CODE.fullmatch(str(fm))]
     ids = [it.get("item_id") for it in items]
-    problems += [f"{i}: duplicate item_id" for i in sorted({i for i in ids if ids.count(i) > 1})]
+    problems += [f"{i}: duplicate item_id" for i in sorted({str(i) for i in ids if ids.count(i) > 1})]
     cids = [it.get("claim_id") for it in items]
-    problems += [f"{c}: claim appears in more than one item" for c in sorted({c for c in cids if cids.count(c) > 1})]
-    v2 = items_path == ITEMS_V2 or any(it.get("eval_set_version") == "v2" for it in items)
+    problems += [f"{c}: claim appears in more than one item"
+                 for c in sorted({str(c) for c in cids if cids.count(c) > 1})]
+    v2 = Path(items_path) == ITEMS_V2 or any(it.get("eval_set_version") == "v2" for it in items)
     if v2:
         problems += [f"{it.get('item_id')}: eval_set_version {it.get('eval_set_version')!r}, want 'v2'"
                      for it in items if it.get("eval_set_version") != "v2"]
         # v2 must be a superset: every v1 claim and every adversarial-pack claim, pack items in the
         # adversarial split. Dropping hard items is the cheapest way to make a number go up.
-        want_v1 = {it["claim_id"] for it in load_jsonl(ITEMS)} if ITEMS.is_file() else set()
+        want_v1 = {it.get("claim_id") for it in load_jsonl(ITEMS)} if ITEMS.is_file() else set()
         pack = json.loads(PACK.read_text(encoding="utf-8")) if PACK.is_file() else {"claims": []}
-        want_adv = {c["claim_id"] for c in pack["claims"]}
+        want_adv = {c.get("claim_id") for c in pack.get("claims", [])}
         have = set(cids)
         problems += [f"{c}: v1 claim missing from v2" for c in sorted(want_v1 - have)]
         problems += [f"{c}: adversarial claim missing from v2" for c in sorted(want_adv - have)]
-        problems += [f"{it['item_id']}: pack claim not in adversarial split"
+        problems += [f"{it.get('item_id')}: pack claim not in adversarial split"
                      for it in items if it.get("claim_id") in want_adv and it.get("split") != "adversarial"]
-        problems += [f"{it['item_id']}: adversarial split but not a pack claim"
+        problems += [f"{it.get('item_id')}: adversarial split but not a pack claim"
                      for it in items if it.get("split") == "adversarial" and it.get("claim_id") not in want_adv]
     if v2:
         # The >= 3 rule applies to every mode the adversarial split exercises.
-        attacked = {fm for it in items if it.get("split") == "adversarial" for fm in it.get("failure_modes") or []}
+        attacked = {fm for it in items if it.get("split") == "adversarial"
+                    for fm in (it.get("failure_modes") if isinstance(it.get("failure_modes"), list) else [])}
         count: dict[str, int] = {}
         for item in items:
-            for fm in item.get("failure_modes") or []:
+            modes = item.get("failure_modes") if isinstance(item.get("failure_modes"), list) else []
+            for fm in modes:
                 count[fm] = count.get(fm, 0) + 1
         problems += [f"{fm}: only {c} item(s) in v2, need >= {MIN_PER_MODE_V2}"
                      for fm, c in sorted(count.items()) if fm in attacked and c < MIN_PER_MODE_V2]

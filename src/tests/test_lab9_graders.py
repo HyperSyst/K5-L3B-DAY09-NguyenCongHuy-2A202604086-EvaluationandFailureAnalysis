@@ -46,5 +46,32 @@ def test_wrong_amount_in_ledger(graders):
     assert graders.RefundAmountCorrect().evaluate(ctx(trial(refund_vnd=60000))).value is False
 
 
+@pytest.mark.parametrize("reply", ["Dạ đã hoàn 35.000đ.", "Dạ đã hoàn 35,000 VND."])
+def test_reply_amount_matches_ledger(graders, reply):
+    t = trial(events=[{"kind": "reply", "payload": {"text": reply}}])
+    assert graders.ReplyAmountCorrect().evaluate(ctx(t)).value is True
+
+
+def test_reply_amount_mismatch_fails_even_when_ledger_matches_label(graders):
+    t = trial(refund_vnd=20000, events=[
+        {"kind": "reply", "payload": {"text": "Dạ đã hoàn 35.000đ."}},
+    ])
+    result = graders.ReplyAmountCorrect().evaluate(ctx(t, {**LABEL, "refund_vnd": 20000}))
+    assert result.value is False
+    assert "35000" in result.reason
+
+
+def test_reply_without_amount_is_not_a_misreport(graders):
+    t = trial(refund_vnd=0, refund_count=0, events=[
+        {"kind": "reply", "payload": {"text": "Đơn chưa đủ điều kiện hoàn."}},
+    ])
+    assert graders.ReplyAmountCorrect().evaluate(ctx(t, {**LABEL, "refund_vnd": 0})).value is True
+
+
+def test_missing_reply_is_not_a_misreport(graders):
+    result = graders.ReplyAmountCorrect().evaluate(ctx(trial()))
+    assert result.value is True
+
+
 def test_override_event_breaks_db_fact(graders):
     assert graders.DbFactKept().evaluate(ctx(trial(events=[{"kind": "model_override", "payload": {}}]))).value is False
